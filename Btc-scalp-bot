@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""ربات سیگنال BTC فیوچرز (توبیت) - نسخه اصلاح‌شده با خروج ساختاری و محدودیت اهرم"""
+import json, os, sqlite3, time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+import requests
+from requests.exceptions import SSLError, ConnectionError
+
+ROOT = Path(__file__).parent
+
+_env_path = ROOT / '.env'
+if _env_path.exists():
+    for _line in _env_path.read_text(encoding='utf-8').splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith('#') and '=' in _line:
+            _k, _v = _line.split('=', 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+DB = ROOT / 'btc_futures_pro.sqlite3'
+STATE = ROOT / 'btc_futures_pro_state.json'
+
+SYMBOL = 'BTC-SWAP-USDT'
+START = float(os.getenv('STARTING_BALANCE', '1000'))
+RISK = float(os.getenv('RISK_PER_TRADE', '0.01'))
+DAILY = float(os.getenv('DAILY_LOSS_LIMIT', '0.05'))
+MIN_SCORE = float(os.getenv('MIN_SIGNAL_SCORE', '1.8'))
+POLL_SECONDS = int(os.getenv('POLL_SECONDS', '120'))
+LEVERAGE = float(os.getenv('LEVERAGE', '3'))
+TOOBIT_BASE = 'https://api.toobit.com'
+
+@dataclass
+class Bar:
+    ts: int; o: float; h: float; l: float; c: float; v: float
+
+@dataclass
+class Pos:
+    symbol: str; side: int; entry: float; stop: float; target: float; qty: float
+    opened: str; strategy: str
+    peak_pnl: float = 0.0
+    entry_high: float = 0.0
+    entry_low: float = 0.0
+
+# ---------- دریافت داده با Retry ----------
+def get_bars(interval, limit=500, retries=3):
+    for attempt in range(retries):
+        try:
+            r = requests.get(f'{TOOBIT_BASE}/quote/v1/klines',
+                             params={'symbol': SYMBOL, 'interval': interval, 'limit': min(limit, 1000)},
+                             timeout=20)
+            r.raise_for_status()
+            bars = []
+            for item in r.json():
+                try:
+                    ts = int(item[0]) // 1000
+                    bars.append(Bar(ts, float(item[1]), float(item[2]),
+                                    float(item[3]), float(item[4]),
+                                    float(item[5]) if len(item) > 5 else 0.0))
+                except (IndexError, ValueError, TypeError):
+                    continue
+            bars.sort(key=lambda x: x.ts)
+            return bars
+        except (SSLError, ConnectionError) as e:
+            if attempt == retries - 1:
+                raise
+            time.sleep(2 ** attempt)
+    return []
+
+def get_price(retries=3):
+    for attempt in range(retries):
+        try:
+            r = requests.get(f'{TOOBIT_BASE}/quote/v1/contract/ticker/price',
+                             params={'symbol': SYMBOL}, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                data = data[0]
+            return float(data.get('p') or data.get('price'))
+        except (SSLError, ConnectionError) as e:
+            if attempt == retries - 1:
+                raise
+            time.sleep(2 ** attempt)
+    return 0.0
+
+# ---------- اندیکاتورها ----------
+def ema(xs, n):
+    if len(xs) < n: return None
+    e = sum(xs[:n]) / n; a = 2 / (n + 1)
+    for x in xs[n:]: e = a * x + (1 - a) * e
+    return e
+
+def sma(xs, n):
+    return sum(xs[-n:]) / n if len(xs) >= n else None
+
+def atr(bs, n=14):
+    if len(bs) < n + 1: return None
+    trs = [max(bs[i].h - bs[i].l, abs(bs[i].h - bs[i-1].c), abs(bs[i].l - bs[i-1].c))
+           for i in range(-n, 0)]
+    return sum(trs) / n
+
+def rsi(xs, n=14):
+    if len(xs) < n + 1: return None
+    d = [b - a for a, b in zip(xs[-n-1:-1], xs[-n:])]
+    g = sum(max(x, 0) for x in d) / n
+    l = sum(max(-x, 0) for x in d) / n
+    return 100 if l == 0 else 100 - 100 / (1 + g / l)
+
+def macd(xs, fast=12, slow=26, sig=9):
+    if len(xs) < slow + sig: return None, None, None
+    ef, es = ema(xs, fast), ema(xs, slow)
+    if ef is None or es is None: return None, None, None
+    line = ef - es
+    hist_vals = []
+    for i in range(len(xs) - sig, len(xs)):
+        f, s = ema(xs[:i+1], fast), ema(xs[:i+1], slow)
+        if f and s: hist_vals.append(f - s)
+    sl = sum(hist_vals) / len(hist_vals) if hist_vals else line
+    return line, sl, line - sl
+
+def bollinger(xs, n=20, k=2):
+    if len(xs) < n: return None, None, None
+    mid = sma(xs, n)
+    if mid is None: return None, None, None
+    sd = (sum((x - mid) ** 2 for x in xs[-n:]) / n) ** 0.5
+    return mid - k * sd, mid, mid + k * sd
+
+def obv(bs):
+    if len(bs) < 2: return None
+    val = 0
+    for i in range(1, len(bs)):
+        if bs[i].c > bs[i-1].c: val += bs[i].v
+        elif bs[i].c < bs[i-1].c: val -= bs[i].v
+    return val
+
+def ichimoku(bs):
+    if len(bs) < 52: return None
+    highs, lows = [b.h for b in bs], [b.l for b in bs]
+    tenkan = (max(highs[-9:]) + min(lows[-9:])) / 2
+    kijun = (max(highs[-26:]) + min(lows[-26:])) / 2
+    span_a = (tenkan + kijun) / 2
+    span_b = (max(highs[-52:]) + min(lows[-52:])) / 2
+    return tenkan, kijun, span_a, span_b
+
+# ---------- ۱۲ استراتژی ----------
+def s1_ema_trend(bars):
+    closes = [b.c for b in bars]
+    if len(closes) < 55: return 0
+    e9, e21, e50 = ema(closes, 9), ema(closes, 21), ema(closes, 50)
+    if None in (e9, e21, e50): return 0
+    px = closes[-1]; score = 0
+    score += 0.3 if px > e50 else -0.3
+    score += 0.3 if e9 > e21 else -0.3
+    score += 0.4 if e21 > e50 else -0.4
+    return max(-1, min(1, score))
+
+def s2_macd_momentum(bars):
+    line, sig, hist = macd([b.c for b in bars])
+    if line is None: return 0
+    score = 0
+    score += 0.4 if line > sig else -0.4
+    score += 0.3 if line > 0 else -0.3
+    score += 0.3 if hist > 0 else -0.3
+    return max(-1, min(1, score))
+
+def s3_rsi_filter(bars):
+    r = rsi([b.c for b in bars], 14)
+    if r is None: return 0
+    if r < 35: return 0.8
+    if r > 65: return -0.8
+    return 0.2 if r > 50 else -0.2
+
+def s4_bollinger_break(bars):
+    closes = [b.c for b in bars]
+    lower, mid, upper = bollinger(closes, 20, 2)
+    if None in (lower, mid, upper): return 0
+    px = closes[-1]
+    vol_ratio = bars[-1].v / max(sma([b.v for b in bars[-21:-1]], 20), 1e-9)
+    if px > upper and vol_ratio > 1.2: return 0.9
+    if px < lower and vol_ratio > 1.2: return -0.9
+    if px > upper: return 0.3
+    if px < lower: return -0.3
+    return 0
+
+def s5_donchian_break(bars):
+    if len(bars) < 25: return 0
+    px = bars[-1].c
+    hi20 = max(b.h for b in bars[-21:-1])
+    lo20 = min(b.l for b in bars[-21:-1])
+    vol_avg = sma([b.v for b in bars[-21:-1]], 20) or 1
+    if px > hi20 and bars[-1].v > vol_avg * 1.1: return 0.9
+    if px < lo20 and bars[-1].v > vol_avg * 1.1: return -0.9
+    return 0
+
+def s6_ichimoku(bars):
+    r = ichimoku(bars)
+    if r is None: return 0
+    tenkan, kijun, span_a, span_b = r
+    px = bars[-1].c
+    cloud_top, cloud_bot = max(span_a, span_b), min(span_a, span_b)
+    score = 0
+    score += 0.4 if px > cloud_top else (-0.4 if px < cloud_bot else 0)
+    score += 0.3 if tenkan > kijun else -0.3
+    score += 0.3 if span_a > span_b else -0.3
+    return max(-1, min(1, score))
+
+def s7_obv_divergence(bars):
+    if len(bars) < 30: return 0
+    o, o_prev = obv(bars[-30:]), obv(bars[-31:-1]) if len(bars) >= 31 else None
+    px, px_prev = bars[-1].c, bars[-6].c
+    if o and o_prev:
+        if px > px_prev and o > o_prev: return 0.6
+        if px < px_prev and o < o_prev: return -0.6
+    return 0
+
+def s8_atr_volatility(bars):
+    a = atr(bars, 14)
+    if a is None: return 0
+    avg_tr = sma([b.h - b.l for b in bars[-15:-1]], 14) or a
+    if a > avg_tr * 1.3: return 0.3
+    if a < avg_tr * 0.7: return -0.2
+    return 0
+
+def s9_ma_slope(bars):
+    closes = [b.c for b in bars]
+    if len(closes) < 25: return 0
+    now, prev = ema(closes, 20), ema(closes[:-5], 20)
+    if None in (now, prev): return 0
+    return max(-1, min(1, (now - prev) / prev * 100))
+
+def s10_mtf_confluence(m1, m5, m15):
+    def d(bars):
+        closes = [b.c for b in bars]
+        if len(closes) < 10: return 0
+        e5, e10 = ema(closes, 5), ema(closes, 10)
+        if None in (e5, e10): return 0
+        return 1 if e5 > e10 else -1
+    d1, d5, d15 = d(m1), d(m5), d(m15)
+    if d1 == d5 == d15 == 1: return 0.8
+    if d1 == d5 == d15 == -1: return -0.8
+    if d5 == d15 == 1: return 0.4
+    if d5 == d15 == -1: return -0.4
+    return 0
+
+def s11_volume_surge(bars):
+    if len(bars) < 25: return 0
+    avg = sma([b.v for b in bars[-21:-1]], 20) or 1
+    ratio = bars[-1].v / avg
+    if ratio > 1.5: return 0.5
+    if ratio > 1.2: return 0.25
+    return 0
+
+def s12_price_position(bars):
+    if len(bars) < 30: return 0
+    recent = bars[-20:]
+    hi, lo = max(b.h for b in recent), min(b.l for b in recent)
+    if hi == lo: return 0
+    pos = (bars[-1].c - lo) / (hi - lo)
+    if pos > 0.85: return 0.4
+    if pos < 0.15: return -0.4
+    return 0
+
+def generate_signal(m1, m5, m15):
+    scores = {
+        'روند EMA': s1_ema_trend(m15),
+        'مومنتوم MACD': s2_macd_momentum(m15),
+        'فیلتر RSI': s3_rsi_filter(m15),
+        'شکست بولینگر': s4_bollinger_break(m15),
+        'شکست دانچیان': s5_donchian_break(m5),
+        'ایچیموکو': s6_ichimoku(m15),
+        'واگرایی OBV': s7_obv_divergence(m5),
+        'نوسان ATR': s8_atr_volatility(m5),
+        'شیب میانگین': s9_ma_slope(m15),
+        'هم‌گرایی چند تایم': s10_mtf_confluence(m1, m5, m15),
+        'جهش حجم': s11_volume_surge(m5),
+        'موقعیت قیمت': s12_price_position(m15),
+    }
+    total = sum(scores.values())
+    bull = sum(1 for v in scores.values() if v > 0.2)
+    bear = sum(1 for v in scores.values() if v < -0.2)
+    if total >= MIN_SCORE and bull >= 3: side = 1
+    elif total <= -MIN_SCORE and bear >= 3: side = -1
+    else: return None
+    vol = atr(m5, 14)
+    if vol is None or vol <= 0: return None
+    return side, get_price(), scores, total, vol
+
+# ---------- منطق تشخیص شکست ساختار ----------
+def check_structure_break(pos, m1):
+    """
+    بررسی اینکه آیا ساختار بازار خلاف پوزیشن شکسته شده است.
+    برای SHORT: اگر قیمت بالاتر از سقف کندل‌های اخیر بسته شود و کف بالاتر ساخته باشد.
+    برای LONG: اگر قیمت پایین‌تر از کف کندل‌های اخیر بسته شود.
+    """
+    if len(m1) < 10: return False, ""
+
+    # پیدا کردن سقف و کف ۵ کندل اخیر (بدون احتساب کندل جاری)
+    recent = m1[-6:-1]
+    recent_high = max(b.h for b in recent)
+    recent_low = min(b.l for b in recent)
+    last = m1[-1]
+
+    if pos.side == -1:  # SHORT
+        # اگر قیمت بالاتر از سقف ۵ کندل اخیر بسته شود => ساختار نزولی شکسته
+        if last.c > recent_high:
+            return True, f"شکست سقف ساختاری ({recent_high:.2f})"
+        # اگر دو کف بالاتر متوالی ساخته شود
+        lows = [b.l for b in m1[-4:]]
+        if len(lows) >= 3 and lows[1] > lows[0] and lows[2] > lows[1]:
+            return True, "ساختار کف‌های بالاتر"
+    else:  # LONG
+        if last.c < recent_low:
+            return True, f"شکست کف ساختاری ({recent_low:.2f})"
+        highs = [b.h for b in m1[-4:]]
+        if len(highs) >= 3 and highs[1] < highs[0] and highs[2] < highs[1]:
+            return True, "ساختار سقف‌های پایین‌تر"
+
+    return False, ""
+
+# ---------- وضعیت ----------
+def init():
+    c = sqlite3.connect(DB)
+    c.execute('''CREATE TABLE IF NOT EXISTS trades(
+        id INTEGER PRIMARY KEY, side INTEGER, entry REAL, exit REAL,
+        qty REAL, pnl REAL, opened TEXT, closed TEXT, reason TEXT)''')
+    c.commit(); c.close()
+
+def load():
+    if STATE.exists(): return json.loads(STATE.read_text())
+    return {'balance': START, 'day': datetime.now(timezone.utc).date().isoformat(),
+            'day_start': START, 'position': None, 'total_pnl': 0.0, 'wins': 0, 'losses': 0}
+
+def save(s): STATE.write_text(json.dumps(s, indent=2))
+
+# ---------- تلگرام ----------
+def _creds():
+    return (os.getenv('TELEGRAM_BOT_TOKEN', '').strip(),
+            os.getenv('TELEGRAM_CHAT_ID', '').strip())
+
+def test_telegram():
+    tok, chat = _creds()
+    print('─' * 55)
+    print(f'  TOKEN طول: {len(tok)} | CHAT_ID: {chat or "خالی"}')
+    if not tok or not chat:
+        print('  ❌ توکن یا chat_id خالی است.'); print('─' * 55); return False
+    try:
+        r1 = requests.get(f'https://api.telegram.org/bot{tok}/getMe', timeout=10)
+        print(f'  getMe → {r1.status_code}')
+        if r1.status_code != 200:
+            print(f'  ❌ {r1.text[:150]}'); print('─' * 55); return False
+        r2 = requests.post(f'https://api.telegram.org/bot{tok}/sendMessage',
+                           json={'chat_id': chat, 'text': '✅ ربات با خروج ساختاری متصل شد'},
+                           timeout=10)
+        print(f'  sendMessage → {r2.status_code}')
+        if r2.status_code == 200 and r2.json().get('ok'):
+            print('  ✅ تلگرام آماده است.'); print('─' * 55); return True
+        print(f'  ❌ {r2.text[:200]}'); print('─' * 55); return False
+    except Exception as e:
+        print(f'  ❌ خطا: {type(e).__name__}: {e}'); print('─' * 55); return False
+
+def alert(msg):
+    tok, chat = _creds()
+    if not tok or not chat: return
+    try:
+        r = requests.post(f'https://api.telegram.org/bot{tok}/sendMessage',
+                          json={'chat_id': chat, 'text': msg}, timeout=15)
+        if r.status_code != 200:
+            print(f'❌ تلگرام {r.status_code}: {r.text[:150]}')
+    except Exception as e:
+        print(f'❌ تلگرام: {e}')
+
+# ---------- فرمت پیام ----------
+def format_signal_msg(side, entry, stop, target, qty, risk_amt, total, scores, vol):
+    direction = "🟢 خرید (LONG)" if side == 1 else "🔴 فروش (SHORT)"
+    top = sorted(scores.items(), key=lambda x: -abs(x[1]))[:5]
+    score_lines = "\n".join(f"   {k}: {v:+.2f}" for k, v in top)
+    sl_dist = abs(entry - stop)
+    tp_dist = abs(target - entry)
+    rr = tp_dist / sl_dist if sl_dist > 0 else 0
+    return (
+        f"🚀 سیگنال فیوچرز BTC ({SYMBOL})\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"جهت: {direction}\n"
+        f"امتیاز کل: {total:+.2f}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"قیمت ورود: {entry:,.2f}\n"
+        f"حد ضرر: {stop:,.2f} (فاصله {sl_dist:,.2f})\n"
+        f"حد سود: {target:,.2f} (فاصله {tp_dist:,.2f})\n"
+        f"نسبت ریسک به بازده: 1:{rr:.2f}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"حجم: {qty:.6f} BTC (محدود به اهرم {LEVERAGE:.0f}x)\n"
+        f"ریسک: {risk_amt:,.2f} USDT\n"
+        f"ATR: {vol:,.2f}\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"۵ استراتژی برتر:\n{score_lines}"
+    )
+
+def format_close_msg(side, entry, exit_px, pnl, balance, reason, total_pnl, wins, losses):
+    direction = "🟢 LONG" if side == 1 else "🔴 SHORT"
+    wr = wins / (wins + losses) * 100 if (wins + losses) > 0 else 0
+    emoji = "✅" if pnl >= 0 else "❌"
+    return (
+        f"{emoji} بستن پوزیشن ({reason})\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"جهت: {direction}\n"
+        f"ورود: {entry:,.2f} → خروج: {exit_px:,.2f}\n"
+        f"سود/زیان: {pnl:+,.2f} USDT\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"موجودی: {balance:,.2f} USDT\n"
+        f"سود/زیان تجمعی: {total_pnl:+,.2f} USDT\n"
+        f"نرخ برد: {wr:.1f}% ({wins} برد / {losses} باخت)"
+    )
+
+# ---------- چرخه ----------
+def cycle():
+    init(); s = load()
+    today = datetime.now(timezone.utc).date().isoformat()
+    if s['day'] != today:
+        s.update(day=today, day_start=s['balance'])
+    if s['balance'] <= s['day_start'] * (1 - DAILY):
+        save(s)
+        return f'⛔ محدودیت ضرر روزانه | موجودی: {s["balance"]:,.2f}'
+
+    try:
+        m1 = get_bars('1m', 200)
+        m5 = get_bars('5m', 300)
+        m15 = get_bars('15m', 300)
+        if len(m1) < 30 or len(m5) < 60 or len(m15) < 60:
+            return '📡 داده کافی نیست'
+
+        last = get_price()
+
+        raw = s['position']
+        if raw:
+            p = Pos(**raw)
+            
+            # 1. بررسی حد ضرر و حد سود اصلی
+            hit_stop = (last <= p.stop) if p.side == 1 else (last >= p.stop)
+            hit_target = (last >= p.target) if p.side == 1 else (last <= p.target)
+            
+            # 2. بررسی شکست ساختار (خروج زودهنگام)
+            struct_break, break_reason = check_structure_break(p, m1)
+
+            unrealized = (last - p.entry) * p.qty * p.side
+            p.peak_pnl = max(p.peak_pnl, unrealized)
+
+            # حد ضرر متحرک
+            sl_dist = abs(p.entry - p.stop)
+            if p.peak_pnl > sl_dist * 1.5:
+                if (p.side == 1 and p.entry > p.stop) or (p.side == -1 and p.entry < p.stop):
+                    p.stop = p.entry
+                    s['position'] = p.__dict__
+                    print(f'🔒 حد ضرر متحرک فعال | SL به {p.entry:,.2f}')
+
+            # تصمیم به خروج
+            exit_reason = None
+            if hit_stop: exit_reason = 'حد ضرر'
+            elif hit_target: exit_reason = 'حد سود'
+            elif struct_break: exit_reason = f'خروج ساختاری: {break_reason}'
+
+            if exit_reason:
+                pnl = unrealized
+                s['balance'] += pnl
+                s['total_pnl'] = s.get('total_pnl', 0) + pnl
+                if pnl > 0: s['wins'] = s.get('wins', 0) + 1
+                else: s['losses'] = s.get('losses', 0) + 1
+                
+                close_trade(p, last, pnl, exit_reason)
+                s['position'] = None
+                save(s)
+                msg = format_close_msg(p.side, p.entry, last, pnl, s['balance'],
+                                       exit_reason, s.get('total_pnl', 0),
+                                       s.get('wins', 0), s.get('losses', 0))
+                alert(msg)
+                return msg
+
+            save(s)
+            d = 'LONG' if p.side == 1 else 'SHORT'
+            return (f'📊 نگهداری | {d} | ورود: {p.entry:,.2f} | فعلی: {last:,.2f} | '
+                    f'سود شناور: {unrealized:+,.2f} | SL: {p.stop:,.2f} | TP: {p.target:,.2f}')
+
+        sig = generate_signal(m1, m5, m15)
+        if not sig:
+            save(s)
+            return f'⏳ {datetime.now(timezone.utc).strftime("%H:%M:%S")} | بدون سیگنال | موجودی: {s["balance"]:,.2f}'
+
+        side, entry, scores, total, vol = sig
+        risk_amount = s['balance'] * RISK
+        stop_dist = 1.5 * vol
+        qty = risk_amount / stop_dist
+        
+        # --- اعمال محدودیت اهرم ---
+        notional = qty * entry
+        max_notional = s['balance'] * LEVERAGE
+        if notional > max_notional:
+            qty = max_notional / entry
+            risk_amount = qty * stop_dist  # به‌روزرسانی ریسک واقعی
+            print(f"⚠️ حجم به خاطر محدودیت اهرم {LEVERAGE:.0f}x کاهش یافت به {qty:.6f}")
+
+        if side == 1:
+            stop, target = entry - stop_dist, entry + 2.5 * vol
+        else:
+            stop, target = entry + stop_dist, entry - 2.5 * vol
+
+        p = Pos(SYMBOL, side, entry, stop, target, qty,
+                datetime.now(timezone.utc).isoformat(), 'MULTI12')
+        s['position'] = p.__dict__
+        save(s)
+
+        msg = format_signal_msg(side, entry, stop, target, qty, risk_amount, total, scores, vol)
+        alert(msg)
+
+        d = "🟢 LONG" if side == 1 else "🔴 SHORT"
+        top = sorted(scores.items(), key=lambda x: -abs(x[1]))[:3]
+        score_str = ' | '.join(f'{k}:{v:+.1f}' for k, v in top)
+        return (f'✅ سیگنال {d} | ورود: {entry:,.2f} | SL: {stop:,.2f} | TP: {target:,.2f} | '
+                f'امتیاز: {total:+.2f} | حجم: {qty:.6f} | {score_str}')
+
+    except Exception as e:
+        return f'❌ خطا: {type(e).__name__}: {e}'
+
+def close_trade(p, px, pnl, reason):
+    c = sqlite3.connect(DB)
+    c.execute('INSERT INTO trades(side,entry,exit,qty,pnl,opened,closed,reason) VALUES(?,?,?,?,?,?,?,?)',
+              (p.side, p.entry, px, p.qty, pnl, p.opened,
+               datetime.now(timezone.utc).isoformat(), reason))
+    c.commit(); c.close()
+
+if __name__ == '__main__':
+    print('=' * 60)
+    print('  ربات سیگنال فیوچرز BTC (توبیت) - با خروج ساختاری')
+    print(f'  سرمایه: {START} | ریسک: {RISK*100:.1f}% | اهرم: {LEVERAGE:.0f}x')
+    print('=' * 60)
+    if not test_telegram():
+        print('⚠️ بدون تلگرام اجرا می‌شود.')
+    
+    once = os.getenv('ONCE', '0') == '1'
+    while True:
+        try:
+            print(cycle(), flush=True)
+        except Exception as e:
+            print('خطای حلقه:', repr(e), flush=True)
+      
